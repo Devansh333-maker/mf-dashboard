@@ -1,0 +1,225 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { num, optStr, reqNum, reqStr, runAction, str, type ActionResult } from "@/lib/actions";
+import { AppError } from "@/lib/errors";
+import { actionTx, ADVISORY_ROLES } from "@/lib/server";
+import {
+  addPlanItem, addSipItem, approvePlan, cancelPlanItem, closePlan, createDraftPlan, deleteDraftPlanItem,
+  deleteDraftSipItem, updatePlanItem, answerReportQuestion, type PlanItemInput,
+} from "@/services/plans";
+import type { Tx } from "@/lib/db/tx";
+import { convertMigrateNotes } from "@/services/migrations";
+import { convertBuyToSip, convertSipToLumpsum, updateSipAmounts } from "@/services/sip";
+
+const opts = { roles: ADVISORY_ROLES };
+
+async function securityName(tx: Tx, id: string | null): Promise<string | null> {
+  if (!id) return null;
+  const r = await tx<{ scheme_name: string }[]>`select scheme_name from public.security_master where id = ${id}`;
+  return r[0]?.scheme_name ?? null;
+}
+
+async function readItem(tx: Tx, fd: FormData): Promise<PlanItemInput> {
+  const action = reqStr(fd, "action", "Action") as PlanItemInput["action"];
+  if (!["SELL", "BUY", "RETAIN"].includes(action)) throw new AppError("Invalid action.");
+  const securityId = optStr(fd, "security_id");
+  const name = (await securityName(tx, securityId)) ?? optStr(fd, "scheme_name");
+  if (!name) throw new AppError("Choose a security.");
+  const target = action === "RETAIN" ? num(fd, "target_amount") ?? 0 : reqNum(fd, "target_amount", "Target amount");
+  if (target < 0) throw new AppError("Target amount cannot be negative.");
+  return {
+    security_id: securityId,
+    scheme_name: name,
+    folio_number: optStr(fd, "folio_number"),
+    action,
+    target_amount: target,
+    target_units: num(fd, "target_units"),
+    current_amount: num(fd, "current_amount"),
+    target_weight: num(fd, "target_weight"),
+    reason: optStr(fd, "reason"),
+    priority: num(fd, "priority") ?? 100,
+    notes: optStr(fd, "notes"),
+  };
+}
+
+const refresh = (clientId: string, planId: string) => {
+  revalidatePath(`/clients/${clientId}/plans/${planId}`);
+  revalidatePath(`/clients/${clientId}`);
+};
+
+export async function createPlanAction(clientId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  let planId = "";
+  const res = await runAction("createPlan", async () => {
+    planId = await actionTx((tx, actor) => createDraftPlan(tx, actor, {
+      clientId,
+      planName: reqStr(fd, "plan_name", "Plan name"),
+      planDate: optStr(fd, "plan_date"),
+      notes: optStr(fd, "notes"),
+      fromSnapshotId: optStr(fd, "snapshot_id"),
+    }), opts);
+  });
+  if (!res.ok) return res;
+  redirect(`/clients/${clientId}/plans/${planId}`);
+}
+
+export async function addPlanItemAction(clientId: string, planId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("addPlanItem", async () => {
+    await actionTx(async (tx, actor) => addPlanItem(tx, actor, planId, await readItem(tx, fd), optStr(fd, "change_reason")), opts);
+    refresh(clientId, planId);
+    return "Item added.";
+  });
+}
+
+export async function updatePlanItemAction(clientId: string, planId: string, itemId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("updatePlanItem", async () => {
+    await actionTx(async (tx) => updatePlanItem(tx, itemId, await readItem(tx, fd), optStr(fd, "change_reason")), opts);
+    refresh(clientId, planId);
+    return "Item updated.";
+  });
+}
+
+export async function deletePlanItemAction(clientId: string, planId: string, itemId: string, _p: ActionResult | null): Promise<ActionResult> {
+  return runAction("deletePlanItem", async () => {
+    await actionTx((tx) => deleteDraftPlanItem(tx, itemId), opts);
+    refresh(clientId, planId);
+    return "Item removed from draft.";
+  });
+}
+
+export async function cancelPlanItemAction(clientId: string, planId: string, itemId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("cancelPlanItem", async () => {
+    await actionTx((tx) => cancelPlanItem(tx, itemId, reqStr(fd, "reason", "Reason")), opts);
+    refresh(clientId, planId);
+    return "Item cancelled.";
+  });
+}
+
+export async function addSipAction(clientId: string, planId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("addSip", async () => {
+    await actionTx(async (tx, actor) => {
+      const securityId = optStr(fd, "security_id");
+      const name = (await securityName(tx, securityId)) ?? optStr(fd, "scheme_name");
+      if (!name) throw new AppError("Choose a scheme.");
+      const action = reqStr(fd, "action") as "START" | "STOP" | "CHANGE";
+      return addSipItem(tx, actor, planId, {
+        security_id: securityId, scheme_name: name, action,
+        old_amount: num(fd, "old_amount"), new_amount: num(fd, "new_amount"),
+        frequency: str(fd, "frequency") || "MONTHLY", debit_day: num(fd, "debit_day"), notes: optStr(fd, "notes"),
+      }, optStr(fd, "change_reason"));
+    }, opts);
+    refresh(clientId, planId);
+    return "SIP action added.";
+  });
+}
+
+export async function deleteSipAction(clientId: string, planId: string, sipId: string, _p: ActionResult | null): Promise<ActionResult> {
+  return runAction("deleteSip", async () => {
+    await actionTx((tx) => deleteDraftSipItem(tx, sipId), opts);
+    refresh(clientId, planId);
+    return "SIP item removed.";
+  });
+}
+
+export async function resolveSipSecurityAction(clientId: string, planId: string, sipId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("resolveSipSecurity", async () => {
+    const securityId = reqStr(fd, "security_id", "Security");
+    await actionTx(async (tx) => {
+      const name = await securityName(tx, securityId);
+      await tx`update public.sip_plan_items set security_id = ${securityId}, scheme_name = ${name ?? ""}, needs_review = false where id = ${sipId}`;
+    }, opts);
+    refresh(clientId, planId);
+    return "Security confirmed.";
+  });
+}
+
+export async function approvePlanAction(clientId: string, planId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("approvePlan", async () => {
+    if (str(fd, "confirm") !== "yes") throw new AppError("Tick the confirmation box to approve.");
+    const outcome = await actionTx((tx, actor) => approvePlan(tx, actor, planId, optStr(fd, "reason")), opts);
+    refresh(clientId, planId);
+    return outcome === "MERGED"
+      ? "Added to the active plan as a new tranche; the fresh money is recorded. Open the active plan to issue the calls."
+      : "Plan approved and ACTIVE. Targets are now frozen; changes require a reason.";
+  });
+}
+
+export async function closePlanAction(clientId: string, planId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("closePlan", async () => {
+    const status = reqStr(fd, "status") as "COMPLETED" | "CANCELLED";
+    await actionTx((tx) => closePlan(tx, planId, status, reqStr(fd, "reason", "Reason")), opts);
+    refresh(clientId, planId);
+    return `Plan marked ${status}.`;
+  });
+}
+
+/** Turn "Migrate to Direct" notes on Keep lines into a Sell of the Regular plan + a Buy of the Direct plan. */
+export async function convertMigrateNotesAction(clientId: string, planId: string, _p: ActionResult | null, _fd: FormData): Promise<ActionResult> {
+  return runAction("convertMigrateNotes", async () => {
+    const n = await actionTx((tx, actor) => convertMigrateNotes(tx, actor, planId), opts);
+    refresh(clientId, planId);
+    return n ? `${n} Regular fund(s) now a Sell + a Buy of the Direct plan.` : "Nothing to convert: no Regular holding has a Migrate to Direct note.";
+  });
+}
+
+/** Last-moment change: a lump-sum buy line becomes a SIP (monthly amount entered by the advisor). */
+export async function convertBuyToSipAction(clientId: string, planId: string, itemId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("convertBuyToSip", async () => {
+    const day = num(fd, "debit_day");
+    await actionTx((tx, actor) => convertBuyToSip(tx, actor, itemId, {
+      monthlyAmount: reqNum(fd, "monthly_amount", "Monthly SIP amount"),
+      lumpsumAmount: num(fd, "lumpsum_amount"),
+      debitDay: day,
+      reason: reqStr(fd, "reason", "Reason"),
+    }), opts);
+    refresh(clientId, planId);
+    return "Moved to SIP: the lump-sum target is reduced and a SIP start line is added.";
+  });
+}
+
+/** Last-moment change: a SIP line becomes a lump-sum buy. */
+export async function convertSipToLumpsumAction(clientId: string, planId: string, sipId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("convertSipToLumpsum", async () => {
+    await actionTx((tx, actor) => convertSipToLumpsum(tx, actor, sipId, {
+      lumpsumAmount: reqNum(fd, "lumpsum_amount", "Lump-sum amount"),
+      reason: reqStr(fd, "reason", "Reason"),
+    }), opts);
+    refresh(clientId, planId);
+    return "Moved to lump sum: the SIP line is cancelled and a lump-sum buy line is added.";
+  });
+}
+
+/** Change the amount of a SIP line (approved plans need a reason). */
+export async function updateSipAmountsAction(clientId: string, planId: string, sipId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("updateSipAmounts", async () => {
+    await actionTx((tx) => updateSipAmounts(tx, sipId, {
+      oldAmount: num(fd, "old_amount"), newAmount: num(fd, "new_amount"), debitDay: num(fd, "debit_day"),
+    }, reqStr(fd, "reason", "Reason")), opts);
+    refresh(clientId, planId);
+    return "SIP line updated.";
+  });
+}
+
+/** The desk explains a recommendation the reader could not place: Buy, Sell (₹ or %) or Keep. */
+export async function answerReportQuestionAction(clientId: string, planId: string, itemId: string, _p: ActionResult | null, fd: FormData): Promise<ActionResult> {
+  return runAction("answerReportQuestion", async () => {
+    const action = str(fd, "action");
+    if (!["SELL", "BUY", "RETAIN"].includes(action)) throw new AppError("Choose Buy, Sell or Keep.");
+    const raw = str(fd, "size").replace(/[₹,\s]/g, "");
+    const percent = /%$/.test(raw) ? Number(raw.slice(0, -1)) : null;
+    const amount = percent === null && raw ? Number(raw) : null;
+    if ((percent !== null && !Number.isFinite(percent)) || (amount !== null && !Number.isFinite(amount))) throw new AppError("Enter the amount as ₹ (e.g. 150000) or a percentage (e.g. 33%).");
+    // The part already done before onboarding (a CAS newer than the report shows it).
+    const doneRaw = str(fd, "done_amount").replace(/[₹,\s]/g, "");
+    const doneAmount = doneRaw ? Number(doneRaw) : 0;
+    if (!Number.isFinite(doneAmount) || doneAmount < 0) throw new AppError("Enter the amount already done in rupees.");
+    const done = doneAmount > 0 ? { amount: doneAmount, date: str(fd, "done_date") } : null;
+    await actionTx((tx, actor) => answerReportQuestion(tx, actor, itemId, {
+      action: action as "SELL" | "BUY" | "RETAIN", amount, percent, explanation: reqStr(fd, "explanation", "Explanation"), done,
+    }), opts);
+    refresh(clientId, planId);
+    return action === "RETAIN" ? "Answered: kept."
+      : `Answered: ${action === "SELL" ? "sell" : "buy"} line set${done ? "; the part already done is recorded (now, or when the plan is approved)" : ""}.`;
+  });
+}
