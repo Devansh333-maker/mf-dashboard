@@ -1,0 +1,34 @@
+import { afterAll, describe, expect, it } from "vitest";
+import { effectiveTxnType } from "@/lib/parsers/cas";
+import { NOT_SIP_WORDINGS, SIP_WORDINGS, STORED_PURCHASE_NOT_SIP } from "../fixtures/txn-wordings";
+import { sql, TEST_DB } from "./harness";
+
+const describeDb = TEST_DB ? describe : describe.skip;
+afterAll(async () => {
+  await sql?.end();
+});
+
+describeDb("txn_effective_type() in the database = effectiveTxnType() in the app", () => {
+  it("gives the same type for every wording stored as a purchase or a switch in", async () => {
+    const cases: [string, string, number][] = [
+      ...SIP_WORDINGS.map((d): [string, string, number] => ["PURCHASE", d, 10]),
+      ...STORED_PURCHASE_NOT_SIP.map((d): [string, string, number] => ["PURCHASE", d, 10]),
+      ...NOT_SIP_WORDINGS.flatMap(([d, u]): [string, string, number][] => [["PURCHASE", d, u], ["SWITCH_IN", d, u]]),
+    ];
+    for (const [type, d, u] of cases) {
+      const [row] = await sql!<{ t: string }[]>`select public.txn_effective_type(${type}, ${d}, ${u}) as t`;
+      expect(`${type} ${d} → ${row.t}`).toBe(`${type} ${d} → ${effectiveTxnType(type, d, u)}`);
+    }
+  });
+  it("and for every stored type, tax and unknown rows included (they are read again from the description)", async () => {
+    const words = [...SIP_WORDINGS, ...STORED_PURCHASE_NOT_SIP, ...NOT_SIP_WORDINGS.map(([d]) => d),
+      "Redemption", "Redemption less STT", "Purchase", "SIP Purchase - Stamp Duty", "Systematic Investment - Stamp duty",
+      "Switch In", "Switch Out", "Reverse SIP Purchase", "SIP Purchase Rejects", "SIP purchase (reversed)", "Dividend Reinvestment", "Bonus units"];
+    for (const type of ["OTHER", "STT", "TDS", "STAMP_DUTY", "SIP", "PURCHASE", "SWITCH_IN", "REDEMPTION"]) {
+      for (const d of words) for (const u of [10, -10]) {
+        const [row] = await sql!<{ t: string }[]>`select public.txn_effective_type(${type}, ${d}, ${u}) as t`;
+        expect(`${type} ${d} ${u} → ${row.t}`).toBe(`${type} ${d} ${u} → ${effectiveTxnType(type, d, u)}`);
+      }
+    }
+  });
+});

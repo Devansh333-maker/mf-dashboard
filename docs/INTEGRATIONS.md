@@ -1,0 +1,238 @@
+# n8n integration contracts
+
+The schemas live in `lib/integrations/contracts.ts` (zod) and are the single source of truth. The same schemas validate the n8n callbacks **and** the manual "import JSON" screens in the app.
+
+## Authentication
+
+| Direction | Mechanism |
+|---|---|
+| n8n → app | Header `Authorization: Bearer <INTEGRATION_API_KEY>` (in n8n: HTTP Request node → Authentication → Generic → Header Auth) |
+| app → n8n | Header `Authorization: Bearer <N8N_WEBHOOK_TOKEN>` (in n8n: Webhook node → Authentication → Header Auth) |
+
+Responses: `401` bad key · `422` validation failed, with `issues[]` · `404` unknown client or document · `409` duplicate · `201` created · `200` idempotent repeat. Nothing is written unless validation passes. Payloads are limited to 5 MB of JSON; uploads to 25 MB.
+
+## 1. CAS extraction
+
+### 1a. app → n8n: `N8N_CAS_PARSE_WEBHOOK_URL`
+
+Sent when a CAS is uploaded (if the URL is configured) or when someone clicks *Send for extraction*.
+
+```json
+{
+  "cas_document_id": "0f7c…",
+  "client_code": "MN-00241",
+  "client_name": "Client Name",
+  "source": "CAMS",
+  "file_url": "https://<project>.supabase.co/storage/v1/object/sign/client-documents/…?token=…",
+  "file_url_expires_in_seconds": 600,
+  "password": "only-if-the-user-typed-it-or-null",
+  "callback_url": "https://your-app/api/integrations/cas-parse-result"
+}
+```
+
+`password` exists only in this one request. The app never stores or logs it, and n8n must not persist it either (disable "Save execution data" for this workflow, or strip the field).
+
+**Recommended workflow:** Webhook → HTTP Request (download `file_url`) → decrypt the PDF (e.g. a small `qpdf`/`pikepdf` service, or the Python `casparser` library, which parses CAMS/KFintech CAS deterministically) → *or* Claude with a strict JSON schema prompt → map to the contract below → HTTP Request `POST callback_url`. On any error, post the FAILED form.
+
+### 1b. n8n → app: `POST /api/integrations/cas-parse-result`
+
+```json
+{
+  "cas_document_id": "0f7c…",
+  "status": "PARSED",
+  "extraction_method": "AI_EXTRACTION",
+  "statement": {
+    "source": "CAMS",
+    "statement_from_date": "1984-01-01",
+    "statement_to_date": "2026-09-24",
+    "valuation_date": "2026-09-23",
+    "investor_name": "…",
+    "investor_pan": "ABCDE1234F"
+  },
+  "holdings": [
+    {
+      "scheme_name": "Axis Gold and Silver Passive FoF - Regular Growth",
+      "isin": "INF846K01XXX",
+      "amc": "Axis",
+      "folio_number": "914213726096/0",
+      "plan_type": "REGULAR",
+      "category": "Gold & silver FoF",
+      "units": 38123.456,
+      "nav": 11.4688,
+      "nav_date": "2026-09-23",
+      "current_value": 437226.00,
+      "cost_value": 400000.00
+    }
+  ],
+  "transactions": [
+    { "date": "2025-12-29", "type": "PURCHASE", "scheme_name": "…", "isin": "…", "folio_number": "…",
+      "units": 38123.456, "nav": 10.4924, "amount": 400000, "balance_units": 38123.456, "description": "Purchase" }
+  ],
+  "totals": { "current_value": 1577657, "invested_value": 1551257 },
+  "warnings": ["Page 7 was partially unreadable"]
+}
+```
+
+Failure form: `{ "cas_document_id": "…", "status": "FAILED", "error": "Incorrect PDF password" }`
+
+Field rules:
+- `holdings`: at least 1 line. `units` and `current_value` ≥ 0. `isin` must be 12 characters in ISIN format. `plan_type` is `DIRECT` or `REGULAR`.
+- `transactions[].type` is one of: `PURCHASE, SIP, REDEMPTION, SWITCH_IN, SWITCH_OUT, DIVIDEND_PAYOUT, DIVIDEND_REINVESTMENT, BONUS, MERGER, STAMP_DUTY, STT, TDS, OTHER`. Use signed units (negative for redemptions / switch-outs). SIP instalments **must** use `SIP` so that reconciliation can explain SIP-driven increases.
+
+What the app does:
+1. Idempotency: if the CAS already has a snapshot, it returns it (`duplicate: true`).
+2. Deterministic validation. Any of the following sets the CAS to `NEEDS_REVIEW` instead of `PARSED`:
+   - the sum of holdings differs from `totals.current_value` by more than 0.5%
+   - units × NAV differs from a line's value by more than 2%
+   - an ISIN is missing
+   - the statement PAN does not match the client's PAN
+   - a snapshot with the same date and value already exists
+3. Creates a **new** `PENDING_REVIEW` snapshot. Holdings resolve to `security_master` by ISIN, and a new ISIN creates a new entry. Transactions are de-duplicated against earlier statements.
+4. A person reviews the snapshot and confirms it. The first confirmed snapshot becomes the baseline; every later confirmation automatically starts a reconciliation run.
+
+Response: `201 {"ok":true,"status":"PARSED"|"NEEDS_REVIEW"|"FAILED","snapshotId":"…","duplicate":false,"warnings":[…]}`
+
+### 1c. n8n → app: `POST /api/integrations/cas-upload` (multipart)
+
+For workflows that *receive* CAS PDFs, e.g. an email inbox. Form fields: `file` (PDF), `client_code`, `source`, `password_protected` (`true`/`false`), `notes`, optionally `password` (forwarded once, not stored) and `trigger_parse=false` to skip extraction. Duplicate files (same SHA-256 for the client) return `409`.
+
+## 2. Advisory report extraction → DRAFT plan
+
+### 2a. app → n8n: `N8N_ADVISORY_PARSE_WEBHOOK_URL`
+
+```json
+{ "document_id": "…", "client_code": "MN-00241", "client_name": "…", "file_url": "…signed…",
+  "file_url_expires_in_seconds": 600, "callback_url": "https://your-app/api/integrations/advisory-report-result" }
+```
+
+### 2b. n8n → app: `POST /api/integrations/advisory-report-result`
+
+The shape follows a typical rebalancing report: the per-folio sell list, the buy list and the SIP table.
+
+```json
+{
+  "client_code": "MN-00241",
+  "document_id": "…",
+  "status": "PARSED",
+  "plan": { "plan_name": "Portfolio rebalancing & execution report", "plan_date": "2026-09-24",
+            "starting_portfolio_value": 1577657, "notes": "Moderate risk · wealth creation" },
+  "items": [
+    { "action": "SELL",   "scheme_name": "Bandhan Silver ETF FoF (Reg)", "folio_number": "8111234/09",
+      "current_amount": 188225, "target_amount": 188225, "reason": "Full exit", "priority": 10 },
+    { "action": "SWITCH", "scheme_name": "Mahindra Manulife Multi Cap Fund (Reg)", "current_amount": 189295,
+      "target_amount": 189295, "switch_to_scheme_name": "Mahindra Manulife Multi Cap Fund (Direct)" },
+    { "action": "RETAIN", "scheme_name": "…", "current_amount": 100000, "target_amount": 0 },
+    { "action": "BUY",    "scheme_name": "Edelweiss Mid Cap Fund - Direct Growth", "isin": "INF…",
+      "target_amount": 202656.82, "target_weight": 12.8, "reason": "Core mid cap; balancing line" }
+  ],
+  "sip_items": [
+    { "action": "STOP",  "scheme_name": "PGIM India Flexi Cap (Reg)", "old_amount": 2500, "debit_day": 8 },
+    { "action": "START", "scheme_name": "Edelweiss Mid Cap Fund (Direct)", "new_amount": 2000, "frequency": "MONTHLY" }
+  ],
+  "declared_totals": { "exit_value": 1577656.82, "buy_value": 1577656.82, "sip_value": 7600 },
+  "warnings": []
+}
+```
+
+What the app does:
+- Creates an **`AI_EXTRACTION` DRAFT plan**. It is never ACTIVE, whatever the payload says.
+- Resolves each line to `security_master` by ISIN, or by an unambiguous, plan-type-aware name match. Anything uncertain gets `security_id = null` and `needs_review = true`. The database refuses approval until the advisor resolves those lines.
+- Cross-checks `declared_totals` against the sum of the extracted lines and writes any discrepancies into the plan notes.
+- Is idempotent per `document_id`.
+
+## 3. Reconciliation trigger — `POST /api/integrations/reconciliation-trigger`
+
+```json
+{ "client_code": "MN-00241" }                       // latest confirmed snapshot vs previous
+{ "client_id": "…", "current_snapshot_id": "…" }     // explicit
+```
+
+Returns `{"ok":true,"run_id":"…","existing":false}`. It only **proposes** matches; people decide.
+
+## 4. Notifications
+
+### 4a. app → n8n events: `N8N_NOTIFICATION_WEBHOOK_URL`
+
+Fire-and-forget; failures never block the user action.
+
+```json
+{ "event": "cas.parsed", "occurred_at": "2026-09-24T05:12:00Z",
+  "client": { "id": "…", "client_code": "MN-00241", "full_name": "…" },
+  "actor": null, "data": { "cas_document_id": "…", "snapshot_id": "…", "status": "NEEDS_REVIEW", "warnings": 2 } }
+```
+
+Events: `cas.parsed`, `cas.failed`, `plan.draft_created`, `reconciliation.completed` (plus reserved `advice.*`, `execution.recorded`, `plan.approved`).
+
+### 4b. n8n → app digest: `POST /api/integrations/notifications/digest`
+
+Read-only. Use it from an n8n Schedule trigger (e.g. 18:00 IST) to send each advisor their pending calls:
+
+```json
+{ "ok": true, "generated_at": "…",
+  "metrics": { "calls_issued_today": 6, "pending_value_total": 3699600, "unadvised_activity": 1, "…": "…" },
+  "pending_by_advisor": [{ "advisor_name": "…", "open_calls": 7, "pending_amount": 2100000, "stale_calls": 2 }],
+  "stale_calls": [{ "client_code": "MN-00106", "action": "SELL", "scheme_name": "…", "pending_amount": 800000, "age_days": 7 }] }
+```
+
+## 5. Testing without n8n
+
+- **CAS:** upload the PDF on the client's *Upload CAS* page, then paste the extraction JSON (form 1b, without `cas_document_id`) on the CAS page.
+- **Advisory report:** *Documents → Upload document → Import advisory report extraction (JSON)*.
+- **With curl:**
+
+```bash
+curl -X POST "$APP/api/integrations/cas-parse-result" \
+  -H "authorization: Bearer $INTEGRATION_API_KEY" -H "content-type: application/json" \
+  -d @docs/examples/cas-parse-result.json
+```
+
+Example files: [`docs/examples/`](examples/).
+
+## 6. Daily NAVs — `POST /api/integrations/nav-update`
+
+Every evening n8n downloads AMFI's daily NAV file and posts it unchanged. The app stores every scheme (one row per ISIN, in
+`mf_schemes`) with its latest NAV. Client portfolios are then valued as **units from the latest CAS × latest NAV**
+(`v_holding_live`); the onboarding CAS keeps its own values for ever.
+
+- **Why AMFI and not the Acme MF API:** the AMFI file is one download, is keyed by ISIN (the same key the CAS uses) and
+  covers every plan, **including Regular plans**, which many clients still hold. The Acme fund list covers Direct–Growth
+  plans only and has no ISIN.
+- **Schedule:** 18:00 IST, and again at 23:30 IST. AMFI publishes some funds' NAVs late in the evening. Re-sending is
+  harmless: a NAV only ever moves forward in time.
+- **Request:** `Authorization: Bearer <INTEGRATION_API_KEY>`, `Content-Type: text/plain`, body = the file
+  `https://www.amfiindia.com/spages/NAVAll.txt` as downloaded (about 1.5 MB). Optional `?source=<label>`.
+- **Response:** `{ ok, runId, navDate, schemes, newSchemes, navsUpdated, holdingsPriced, holdingsUnpriced, skippedLines }`.
+  `holdingsUnpriced` counts holdings still valued at their CAS NAV (no ISIN, or no NAV in the file).
+  A file with fewer than 100 schemes is rejected (422), so a broken download never wipes anything.
+- Each delivery is logged in `nav_feed_runs`; the client Portfolio tab shows the NAV date and when the feed last arrived.
+
+n8n workflow (3 nodes): **Schedule Trigger** (18:00 and 23:30, timezone Asia/Kolkata) → **HTTP Request** GET
+`https://www.amfiindia.com/spages/NAVAll.txt` (Response format: Text) → **HTTP Request** POST
+`<APP>/api/integrations/nav-update?source=n8n:amfi`, Authentication: Header Auth credential
+(`Authorization: Bearer <INTEGRATION_API_KEY>`), Body: Raw, content type `text/plain`, body `{{ $json.data }}`.
+
+```bash
+curl -s https://www.amfiindia.com/spages/NAVAll.txt -o NAVAll.txt
+curl -X POST "$APP/api/integrations/nav-update?source=manual" \
+  -H "authorization: Bearer $INTEGRATION_API_KEY" -H "content-type: text/plain" --data-binary @NAVAll.txt
+```
+
+## 7. Claude report reader (Bulk Onboarding)
+
+Advisory reports come in many layouts. The built-in readers (`lib/parsers/*`) run first; when a report does not fully tie out to the CAS, the **Onboard** page (`/onboard`, both tabs) asks Claude to read it through n8n, so the Anthropic key stays in n8n.
+
+**n8n workflow:** "Acme MF Desk - Report reader (Claude)": Webhook (POST, Header Auth) → HTTP Request to `https://api.anthropic.com/v1/messages` (Anthropic credential) → Respond to Webhook with `{ status, body }`. Executions are not saved (the request holds client documents).
+
+**Request** (built in `lib/integrations/report-ai.ts`): model `claude-sonnet-5-5`, effort `high`, structured JSON output (`output_config.format`, schema `REPORT_AI_SCHEMA`). The message carries the report PDF, the CAS fund list (name, folio, plan type, value), the built-in reader's draft and the exact points that did not reconcile. Claude returns sells, buys, SIP changes, kept/deferred funds and totals, plus a list of what it corrected.
+
+**Safety:** Claude's answer is validated with zod and then goes through exactly the same tie-out as any report (`buildPlanFromReport`): every sell and kept fund must match a CAS holding and value, totals must add up, every CAS fund must be covered. Anything that does not tie out is shown as **Needs review** and nothing is saved. A clean result is saved as a **DRAFT** plan whose notes list Claude's corrections; an advisor approves it.
+
+**Rounds:** points still open after Claude's answer go back to Claude with that answer as the draft and per-point instructions (`services/report-resolve.ts`), up to 3 rounds within 240 s of the request (the rest of the 300 s is for saving).
+
+**Funds the report never mentions:** Claude lists them (exact CAS names) in `cas_funds_not_in_report`. They are kept as RETAIN with "Not mentioned in the advisory report… Advisor to confirm" and listed in the plan notes, as long as together they are at most 25% of the portfolio (`NOT_IN_REPORT_LIMIT`); above that the client stays in Needs review. Claude-read plans are stored with source AI_EXTRACTION, and a report that prints no client name must have the client's name in its file name.
+
+**Picture-only CAS PDFs** (scanned, or re-saved with "Microsoft Print to PDF") have no text for the built-in parser. When the reader above is set up, the same relay sends the PDF to Claude to transcribe (`lib/integrations/cas-ai.ts`, schema `CAS_AI_SCHEMA`, transactions of the last 6 months). The built-in cross-checks (units × NAV = value, balances, summary total) run on the answer, and the snapshot is always created as PENDING_REVIEW for a person to confirm. A locked picture-only PDF cannot be sent; the desk is asked for the original.
+
+**Settings:** `REPORT_AI_URL` (the webhook's production URL) and `REPORT_AI_KEY` (also stored in the n8n Header Auth credential, header name `X-Desk-Key`). Without them the page still works and lists unreconciled reports for review.
+
+**Passwords:** bulk onboarding also tries parts of each CAS file name as the password (`fileNamePasswords` in `lib/cas/password.ts`). Passwords are only used in memory; stored copies are renamed (`CAS <name> <date>.pdf`, `Advisory report <name>.pdf`), so a password in a file name never reaches storage or the database.
